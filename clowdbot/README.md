@@ -1,6 +1,6 @@
 # clowdbot
 
-Aplicação Node.js (Express) pronta para deploy no Google Cloud Run, focada no fluxo OAuth 2.0 do LinkedIn.
+Aplicação Node.js (Express) pronta para deploy no Google Cloud Run, focada no fluxo OAuth 2.0 do LinkedIn..
 
 ## Como rodar localmente
 
