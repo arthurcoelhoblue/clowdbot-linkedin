@@ -1,76 +1,157 @@
 import crypto from "crypto";
 import express from "express";
+import cookieParser from "cookie-parser";
+import jwt from "jsonwebtoken";
 
 const app = express();
+app.use(cookieParser());
 
 const port = process.env.PORT || 8080;
+
+const CLIENT_ID = process.env.LINKEDIN_CLIENT_ID || "";
+const CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET || "";
+const REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "";
+
+const SCOPE = "openid profile email";
+
+// MVP storage em memória (para teste). Em Cloud Run pode resetar.
+const tokenStore = new Map(); // key: sub, value: { access_token, expires_at, scope, profile }
+
+function assertEnv() {
+  const missing = [];
+  if (!CLIENT_ID) missing.push("LINKEDIN_CLIENT_ID");
+  if (!CLIENT_SECRET) missing.push("LINKEDIN_CLIENT_SECRET");
+  if (!REDIRECT_URI) missing.push("LINKEDIN_REDIRECT_URI");
+  if (missing.length) {
+    const msg = `Missing env vars: ${missing.join(", ")}`;
+    throw new Error(msg);
+  }
+}
 
 app.get("/", (req, res) => {
   res.type("text").send("clowdbot ok");
 });
 
 app.get("/auth/linkedin", (req, res) => {
-  const state = crypto.randomBytes(16).toString("hex");
-  const params = new URLSearchParams({
-    response_type: "code",
-    client_id: process.env.LINKEDIN_CLIENT_ID || "",
-    redirect_uri: process.env.LINKEDIN_REDIRECT_URI || "",
-    scope: "openid profile email",
-    state,
-  });
+  try {
+    assertEnv();
 
-  const authUrl = `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`;
-  res.redirect(authUrl);
+    // state anti-CSRF
+    const state = crypto.randomBytes(16).toString("hex");
+
+    // guarda state em cookie httpOnly
+    res.cookie("li_oauth_state", state, {
+      httpOnly: true,
+      secure: true,      // Cloud Run é HTTPS
+      sameSite: "lax",
+      maxAge: 10 * 60 * 1000 // 10 min
+    });
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: SCOPE,
+      state
+    });
+
+    const authUrl = `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`;
+    return res.redirect(authUrl);
+  } catch (e) {
+    return res.status(500).type("text").send(e instanceof Error ? e.message : "Unexpected error");
+  }
 });
 
 app.get("/oauth/linkedin/callback", async (req, res) => {
-  const { code, error, error_description: errorDescription } = req.query;
+  const { code, state, error, error_description: errorDescription } = req.query;
 
   if (error) {
-    return res.status(400).json({
-      error,
-      error_description: errorDescription || "LinkedIn authorization error",
-    });
+    return res.status(400).type("text").send(`LinkedIn authorization error: ${error} - ${errorDescription || ""}`);
   }
 
   if (!code) {
-    return res.status(400).json({
-      error: "missing_code",
-      error_description: "Authorization code not provided.",
-    });
+    return res.status(400).type("text").send("Missing authorization code.");
   }
 
+  // valida state
+  const expectedState = req.cookies?.li_oauth_state;
+  if (!expectedState) {
+    return res.status(400).type("text").send("Missing stored state (cookie not found).");
+  }
+  if (!state || String(state) !== String(expectedState)) {
+    return res.status(400).type("text").send("Invalid state (possible CSRF).");
+  }
+
+  // state ok: limpa cookie para evitar replay
+  res.clearCookie("li_oauth_state");
+
   try {
+    assertEnv();
+
     const tokenResponse = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code: String(code),
-        redirect_uri: process.env.LINKEDIN_REDIRECT_URI || "",
-        client_id: process.env.LINKEDIN_CLIENT_ID || "",
-        client_secret: process.env.LINKEDIN_CLIENT_SECRET || "",
-      }),
+        redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET
+      })
     });
 
     const payload = await tokenResponse.json();
 
     if (!tokenResponse.ok) {
-      return res.status(tokenResponse.status).json({
-        error: "token_exchange_failed",
-        error_description: payload,
-      });
+      // NÃO logue payload completo em produção (pode conter info sensível)
+      return res.status(tokenResponse.status).type("text").send(`Token exchange failed: ${JSON.stringify(payload)}`);
     }
 
-    return res.json(payload);
-  } catch (err) {
-    return res.status(500).json({
-      error: "token_exchange_error",
-      error_description: err instanceof Error ? err.message : "Unexpected error",
+    // NÃO retornar tokens. Apenas extrair identidade do id_token.
+    const idToken = payload.id_token;
+    const decoded = jwt.decode(idToken);
+
+    if (!decoded || typeof decoded !== "object") {
+      return res.status(500).type("text").send("Unable to decode id_token.");
+    }
+
+    // checagens mínimas (MVP)
+    if (decoded.aud !== CLIENT_ID) return res.status(400).type("text").send("Invalid id_token audience.");
+    if (decoded.iss !== "https://www.linkedin.com/oauth") return res.status(400).type("text").send("Invalid id_token issuer.");
+
+    const sub = decoded.sub;
+    const expiresAt = Date.now() + (Number(payload.expires_in || 0) * 1000);
+
+    tokenStore.set(sub, {
+      access_token: payload.access_token, // guardado no servidor (MVP)
+      expires_at: expiresAt,
+      scope: payload.scope,
+      profile: {
+        name: decoded.name,
+        email: decoded.email,
+        picture: decoded.picture
+      }
     });
+
+    // resposta segura (sem token)
+    return res
+      .status(200)
+      .type("text")
+      .send(`LinkedIn conectado com sucesso para ${decoded.email || decoded.name || sub}.`);
+  } catch (err) {
+    return res.status(500).type("text").send(err instanceof Error ? err.message : "Unexpected error");
   }
+});
+
+// endpoint opcional: ver perfil sem expor token
+app.get("/me", (req, res) => {
+  const sub = String(req.query.sub || "");
+  if (!sub) return res.status(400).json({ error: "missing_sub" });
+
+  const data = tokenStore.get(sub);
+  if (!data) return res.status(404).json({ error: "not_found" });
+
+  return res.json({ sub, profile: data.profile, scope: data.scope, expires_at: data.expires_at });
 });
 
 app.listen(port, () => {
