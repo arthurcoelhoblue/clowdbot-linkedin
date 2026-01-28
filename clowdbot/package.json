@@ -1,0 +1,16 @@
+{
+  "name": "clowdbot",
+  "version": "1.0.0",
+  "description": "OAuth 2.0 LinkedIn starter for Google Cloud Run",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
